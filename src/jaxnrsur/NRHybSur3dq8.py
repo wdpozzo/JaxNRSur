@@ -260,6 +260,29 @@ class NRHybSur3dq8Model(WaveformModel):
         return len(self.data.modes)
 
     @staticmethod
+    def get_fit_params(
+        params: Float[Array, " n_dim"],
+    ) -> Float[Array, " n_dim"]:
+        """
+        Map the physical parameters onto the coordinates the surrogate fits were
+        trained in: (q, chi1z, chi2z) -> (log(q), chi_hat, chi_a).
+
+        Args:
+            params (Float[Array, " n_dim"]): [q, chi1z, chi2z].
+
+        Returns:
+            Float[Array, " n_dim"]: [log(q), chi_hat, chi_a].
+        """
+        q, chi1z, chi2z = params[0], params[1], params[2]
+        eta = q / (1 + q) ** 2
+        chi_wt_avg = (q * chi1z + chi2z) / (1 + q)
+        chi_hat = (chi_wt_avg - 38.0 * eta / 113.0 * (chi1z + chi2z)) / (
+            1.0 - 76.0 * eta / 113.0
+        )
+        chi_a = (chi1z - chi2z) / 2.0
+        return jnp.array([jnp.log(q), chi_hat, chi_a])
+
+    @staticmethod
     def get_eim(
         eim_dict: dict, params: Float[Array, " n_dim"]
     ) -> Float[Array, " n_sample"]:
@@ -355,9 +378,10 @@ class NRHybSur3dq8Model(WaveformModel):
         """
         # 22 mode has weird dict that making a specical function is easier.
         q = params[0]
-        params = params[None]
-        amp = self.get_eim(self.data.modes[self.mode_22_index]["amp"], params)
-        phase = -self.get_eim(self.data.modes[self.mode_22_index]["phase"], params)
+        # the EIM fits live in (log q, chi_hat, chi_a); the T3 phase wants the raw q
+        fit_params = self.get_fit_params(params)[None]
+        amp = self.get_eim(self.data.modes[self.mode_22_index]["amp"], fit_params)
+        phase = -self.get_eim(self.data.modes[self.mode_22_index]["phase"], fit_params)
         phase = phase + get_T3_phase(q, self.data.sur_time)  # type: ignore
         amp_interp = CubicSpline(self.data.sur_time, amp)(time)
         phase_interp = CubicSpline(self.data.sur_time, phase)(time)
@@ -386,7 +410,11 @@ class NRHybSur3dq8Model(WaveformModel):
         Returns:
             tuple: Plus and cross polarizations of the waveform.
         """
-        coeff = jnp.stack(jnp.array(self.get_multi_real_imag(self.mode_no22, params)))
+        coeff = jnp.stack(
+            jnp.array(
+                self.get_multi_real_imag(self.mode_no22, self.get_fit_params(params))
+            )
+        )
         modes = eqx.filter_vmap(self.get_mode, in_axes=(0, 0, None))(
             coeff[:, 0], coeff[:, 1], time
         )
