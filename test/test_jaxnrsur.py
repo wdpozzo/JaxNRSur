@@ -77,6 +77,22 @@ def test_get_waveform_td_basic(jaxnrsur_instance):
     assert jnp.allclose(hc, expected_hc, atol=1e-6)
 
 
+def test_get_waveform_td_linear_interface():
+    model = DummyWaveformModel()
+    waveform = JaxNRSur(
+        model=model,
+        alpha_window=0.0,
+        time_interpolation="linear",
+    )
+    time = jnp.linspace(0, 1, 100)
+    params = jnp.array([30.0, 100.0, 0.3, 0.2, 1.1, 0.5, 0.2])
+    plus, cross = waveform.get_waveform_td(time, params)
+    time_m = time * C_SI / RSUN_SI / params[0]
+    scale = params[0] * RSUN_SI / params[1] / MPC_SI
+    assert jnp.allclose(plus, jnp.sin(time_m) * scale)
+    assert jnp.allclose(cross, jnp.cos(time_m) * scale)
+
+
 def test_get_waveform_td_windowing(jaxnrsur_instance):
     # Test that windowing is applied (alpha_window > 0)
     jaxnrsur_instance.alpha_window = 0.2

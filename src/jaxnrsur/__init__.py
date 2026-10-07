@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float
 from jaxnrsur.DataLoader import DataLoader
 from abc import abstractmethod
-from typing import Optional
+from typing import Literal, Optional
 import equinox as eqx
 import logging
 
@@ -33,6 +33,21 @@ class WaveformModel(eqx.Module):
     ) -> tuple[Float[Array, " n_sample"], Float[Array, " n_sample"]]:
         raise NotImplementedError
 
+    def get_waveform_geometric_linear(
+        self,
+        time: Float[Array, " n_sample"],
+        params: Float[Array, " n_param"],
+        theta: Float,
+        phi: Float,
+    ) -> tuple[Float[Array, " n_sample"], Float[Array, " n_sample"]]:
+        """Evaluate with linear time interpolation when the model supports it.
+
+        Models without a specialized sparse implementation retain their usual
+        evaluator. Surrogates backed by an empirical-interpolation basis can
+        override this method to avoid constructing their complete native grid.
+        """
+        return self.get_waveform_geometric(time, params, theta, phi)
+
 
 class JaxNRSur:
     model: WaveformModel
@@ -40,6 +55,7 @@ class JaxNRSur:
     segment_length: Optional[float] = None
     sampling_rate: Optional[int] = None
     alpha_window: float = 0.1
+    time_interpolation: Literal["cubic", "linear"] = "cubic"
 
     def __init__(
         self,
@@ -47,9 +63,13 @@ class JaxNRSur:
         segment_length: Optional[float] = None,
         sampling_rate: Optional[int] = None,
         alpha_window: float = 0.1,
+        time_interpolation: Literal["cubic", "linear"] = "cubic",
     ):
+        if time_interpolation not in ("cubic", "linear"):
+            raise ValueError("time_interpolation must be 'cubic' or 'linear'")
         self.model = model
         self.alpha_window = alpha_window
+        self.time_interpolation = time_interpolation
 
         if segment_length is None or sampling_rate is None:
             logging.warning(
@@ -116,8 +136,14 @@ class JaxNRSur:
 
         # evaluate the surrogate over the equivalent geometric time
         time_m = time * C_SI / RSUN_SI / mtot
-        hrM_p, hrM_c = self.model.get_waveform_geometric(
-            time_m, jnp.array(params[4:]), theta, phi
+        waveform_evaluator = self.model.get_waveform_geometric
+        if self.time_interpolation == "linear":
+            waveform_evaluator = self.model.get_waveform_geometric_linear
+        hrM_p, hrM_c = waveform_evaluator(
+            time_m,
+            jnp.array(params[4:]),
+            theta,
+            phi,
         )
 
         if self.alpha_window > 0:

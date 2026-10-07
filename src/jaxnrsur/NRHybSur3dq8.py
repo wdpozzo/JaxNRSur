@@ -3,7 +3,7 @@ import h5py
 import jax.numpy as jnp
 import jax
 from jaxnrsur.DataLoader import load_data, h5Group_to_dict, h5_mode_tuple
-from jaxnrsur.Spline import CubicSpline
+from jaxnrsur.Spline import CubicSpline, CubicSplineFactorization
 from jaxnrsur.EIMPredictor import EIMpredictor
 from jaxnrsur.Harmonics import SpinWeightedSphericalHarmonics
 from jaxnrsur import WaveformModel
@@ -174,6 +174,9 @@ class NRHybSur3dq8Model(WaveformModel):
     mode_22_index: int
     m_mode: Int[Array, " n_modes-1"]
     negative_mode_prefactor: Int[Array, " n_modes-1"]
+    sparse_cubic_enabled: bool
+    t3_phase_reference: Float[Array, " n_sample"]
+    t3_phase_reference_coefficients: Float[Array, " n_sample"]
 
     def __init__(
         self,
@@ -190,6 +193,7 @@ class NRHybSur3dq8Model(WaveformModel):
             (4, 4),
             (5, 5),
         ],
+        precompute_spline_coefficients: bool = True,
     ):
         """
         Initialize NRHybSur3dq8Model.
@@ -199,6 +203,10 @@ class NRHybSur3dq8Model(WaveformModel):
 
         Args:
             modelist (list[tuple[int, int]]): List of modes to be used.
+            precompute_spline_coefficients (bool): Prepare the exact sparse
+                cubic evaluator. Disable this when only the sparse linear
+                evaluator is needed to avoid retaining a second basis-sized
+                coefficient array.
         """
         self.data = NRHybSur3dq8DataLoader(modelist=modelist)  # type: ignore
         self.harmonics = []
@@ -227,6 +235,37 @@ class NRHybSur3dq8Model(WaveformModel):
             [modelist[i][1] for i in range(len(modelist)) if i != self.mode_22_index]
         )
         self.negative_mode_prefactor = jnp.array(negative_mode_prefactor)
+
+        self.sparse_cubic_enabled = precompute_spline_coefficients
+        if precompute_spline_coefficients:
+            # Cubic spline construction is linear in the values on the fixed
+            # surrogate grid. Factor each EIM basis row once so waveform calls
+            # combine and gather only the two bracketing columns.
+            spline_factorization = CubicSplineFactorization(self.data.sur_time)
+            for mode in self.data.modes:
+                for component_name in ("amp", "phase", "real", "imag"):
+                    if component_name not in mode:
+                        continue
+                    component = mode[component_name]
+                    component["spline_coefficients"] = jax.vmap(
+                        spline_factorization.solve
+                    )(component["eim_basis"])
+
+            reference_q = jnp.asarray(1.0, dtype=self.data.sur_time.dtype)
+            self.t3_phase_reference = get_T3_phase(
+                reference_q,
+                self.data.sur_time,
+            )
+            self.t3_phase_reference_coefficients = spline_factorization.solve(
+                self.t3_phase_reference
+            )
+        else:
+            self.t3_phase_reference = jnp.empty(
+                0, dtype=self.data.sur_time.dtype
+            )
+            self.t3_phase_reference_coefficients = jnp.empty(
+                0, dtype=self.data.sur_time.dtype
+            )
 
     def __call__(
         self,
@@ -281,6 +320,13 @@ class NRHybSur3dq8Model(WaveformModel):
         )
         chi_a = (chi1z - chi2z) / 2.0
         return jnp.array([jnp.log(q), chi_hat, chi_a])
+
+    @staticmethod
+    def get_physical_mass_ratio(
+        params: Float[Array, " n_dim"],
+    ) -> Float:
+        """Return the physical mass ratio used by the analytic T3 phase."""
+        return params[0]
 
     @staticmethod
     def get_eim(
@@ -340,6 +386,135 @@ class NRHybSur3dq8Model(WaveformModel):
             is_leaf=lambda x: isinstance(x, dict),
         )
 
+    @staticmethod
+    def get_eim_at_native_indices(
+        eim_dict: dict,
+        params: Float[Array, " n_dim"],
+        native_indices: Int[Array, " ..."],
+    ) -> Float[Array, " ..."]:
+        """Evaluate an EIM expansion at selected native-grid columns only."""
+        coefficients = jnp.zeros((eim_dict["n_nodes"], 1))
+        for index in range(eim_dict["n_nodes"]):
+            coefficients = coefficients.at[index].set(
+                eim_dict["predictors"][index](params)
+            )
+        selected_basis = jnp.take(
+            eim_dict["eim_basis"],
+            native_indices,
+            axis=1,
+        )
+        return jnp.tensordot(
+            coefficients[:, 0],
+            selected_basis,
+            axes=(0, 0),
+        )
+
+    @staticmethod
+    def get_eim_coefficients(
+        eim_dict: dict,
+        params: Float[Array, " n_dim"],
+    ) -> Float[Array, " n_nodes"]:
+        """Evaluate the parameter-dependent coefficients of an EIM expansion."""
+        coefficients = jnp.zeros((eim_dict["n_nodes"], 1))
+        for index in range(eim_dict["n_nodes"]):
+            coefficients = coefficients.at[index].set(
+                eim_dict["predictors"][index](params)
+            )
+        return coefficients[:, 0]
+
+    def get_spline_brackets(
+        self,
+        time: Float[Array, " ..."],
+    ) -> tuple[
+        Int[Array, " ..."],
+        Int[Array, " ..."],
+        Float[Array, " ..."],
+        Float[Array, " ..."],
+        Float[Array, " ..."],
+        Float[Array, " ..."],
+    ]:
+        """Return native columns and exact natural-cubic interpolation weights."""
+        grid = self.data.sur_time
+        safe_time = jnp.clip(time, grid[0], grid[-1])
+        upper = jnp.clip(jnp.digitize(safe_time, grid), 1, grid.size - 1)
+        lower = upper - 1
+        interval = grid[upper] - grid[lower]
+        distance_left = safe_time - grid[lower]
+        distance_right = grid[upper] - safe_time
+
+        value_weight_left = distance_right / interval
+        value_weight_right = distance_left / interval
+        coefficient_weight_left = (
+            distance_right**3 / (6.0 * interval)
+            - interval * distance_right / 6.0
+        )
+        coefficient_weight_right = (
+            distance_left**3 / (6.0 * interval)
+            - interval * distance_left / 6.0
+        )
+        return (
+            lower,
+            upper,
+            value_weight_left,
+            value_weight_right,
+            coefficient_weight_left,
+            coefficient_weight_right,
+        )
+
+    @staticmethod
+    def evaluate_spline_from_brackets(
+        values: Float[Array, " n_grid"],
+        spline_coefficients: Float[Array, " n_grid"],
+        brackets: tuple,
+    ) -> Float[Array, " ..."]:
+        """Evaluate a represented natural cubic spline at prepared brackets."""
+        (
+            lower,
+            upper,
+            value_weight_left,
+            value_weight_right,
+            coefficient_weight_left,
+            coefficient_weight_right,
+        ) = brackets
+        return (
+            value_weight_left * values[lower]
+            + value_weight_right * values[upper]
+            + coefficient_weight_left * spline_coefficients[lower]
+            + coefficient_weight_right * spline_coefficients[upper]
+        )
+
+    def get_eim_cubic_at_brackets(
+        self,
+        eim_dict: dict,
+        params: Float[Array, " n_dim"],
+        brackets: tuple,
+    ) -> Float[Array, " ..."]:
+        """Evaluate an EIM expansion through its exact sparse cubic spline."""
+        coefficients = self.get_eim_coefficients(eim_dict, params)
+        lower, upper = brackets[:2]
+        basis_left = jnp.take(eim_dict["eim_basis"], lower, axis=1)
+        basis_right = jnp.take(eim_dict["eim_basis"], upper, axis=1)
+        spline_left = jnp.take(
+            eim_dict["spline_coefficients"], lower, axis=1
+        )
+        spline_right = jnp.take(
+            eim_dict["spline_coefficients"], upper, axis=1
+        )
+        values_left = jnp.tensordot(coefficients, basis_left, axes=(0, 0))
+        values_right = jnp.tensordot(coefficients, basis_right, axes=(0, 0))
+        coefficients_left = jnp.tensordot(
+            coefficients, spline_left, axes=(0, 0)
+        )
+        coefficients_right = jnp.tensordot(
+            coefficients, spline_right, axes=(0, 0)
+        )
+        return (
+            brackets[2] * values_left
+            + brackets[3] * values_right
+            + brackets[4] * coefficients_left
+            + brackets[5] * coefficients_right
+        )
+
     def get_mode(
         self,
         real: Float[Array, " n_sample"],
@@ -377,7 +552,7 @@ class NRHybSur3dq8Model(WaveformModel):
             Float[Array, " n_sample"]: Complex (2,2) mode data.
         """
         # 22 mode has weird dict that making a specical function is easier.
-        q = params[0]
+        q = self.get_physical_mass_ratio(params)
         # the EIM fits live in (log q, chi_hat, chi_a); the T3 phase wants the raw q
         fit_params = self.get_fit_params(params)[None]
         amp = self.get_eim(self.data.modes[self.mode_22_index]["amp"], fit_params)
@@ -387,19 +562,125 @@ class NRHybSur3dq8Model(WaveformModel):
         phase_interp = CubicSpline(self.data.sur_time, phase)(time)
         return amp_interp * jnp.exp(1j * phase_interp)
 
-    def get_waveform_geometric(
+    def get_waveform_at_native_indices(
+        self,
+        native_indices: Int[Array, " ..."],
+        params: Float[Array, " n_dim"],
+        theta: Float = 0.0,
+        phi: Float = 0.0,
+    ) -> tuple[Float[Array, " ..."], Float[Array, " ..."]]:
+        """Return polarizations at selected native surrogate-grid samples."""
+        native_indices = jnp.asarray(native_indices, dtype=jnp.int32)
+        native_times = self.data.sur_time[native_indices]
+        fit_params = self.get_fit_params(params)[None]
+
+        mode_22 = self.data.modes[self.mode_22_index]
+        amplitude_22 = self.get_eim_at_native_indices(
+            mode_22["amp"], fit_params, native_indices
+        )
+        phase_22 = -self.get_eim_at_native_indices(
+            mode_22["phase"], fit_params, native_indices
+        )
+        phase_22 += get_T3_phase(
+            self.get_physical_mass_ratio(params),
+            native_times,
+        )
+        h_22 = amplitude_22 * jnp.exp(1j * phase_22)
+
+        waveform = jnp.zeros_like(native_times, dtype=jnp.complex64)
+        waveform += h_22 * SpinWeightedSphericalHarmonics(-2, 2, 2)(
+            theta, phi
+        )
+        waveform += jnp.conj(h_22) * SpinWeightedSphericalHarmonics(
+            -2, 2, -2
+        )(theta, phi)
+
+        for index, harmonics in enumerate(self.harmonics):
+            mode = self.mode_no22[index]
+            real = self.get_eim_at_native_indices(
+                mode["real"], fit_params, native_indices
+            )
+            imag = self.get_eim_at_native_indices(
+                mode["imag"], fit_params, native_indices
+            )
+            complex_mode = real + 1j * imag
+            waveform += complex_mode * harmonics(theta, phi)
+            waveform += (
+                self.negative_mode_prefactor[index]
+                * jnp.conj(complex_mode)
+                * self.negative_harmonics[index](theta, phi)
+            )
+
+        return waveform.real, -waveform.imag
+
+    def get_waveform_geometric_linear(
         self,
         time: Float[Array, " n_sample"],
         params: Float[Array, " n_dim"],
         theta: Float = 0.0,
         phi: Float = 0.0,
     ) -> tuple[Float[Array, " n_sample"], Float[Array, " n_sample"]]:
-        """
-        Compute the geometric waveform (plus and cross polarizations) for given parameters.
+        """Evaluate the native-grid waveform with sparse linear interpolation.
 
-        Current implementation separates the 22 mode from the rest of the modes,
-        due to data structure and combination method. This means CubicSpline is called in a loop,
-        which is not ideal (double the run time). The data structure could be merged for efficiency.
+        Only the two native surrogate samples bracketing each requested time
+        are constructed. This avoids reconstructing all modes on the complete
+        native grid and preserves the ordinary linear interpolation convention,
+        including zero-valued samples outside the surrogate time domain.
+        """
+        time = jnp.asarray(time)
+        surrogate_times = self.data.sur_time
+        in_domain = (time >= surrogate_times[0]) & (
+            time <= surrogate_times[-1]
+        )
+        safe_times = jnp.clip(time, surrogate_times[0], surrogate_times[-1])
+
+        upper_indices = jnp.searchsorted(
+            surrogate_times,
+            safe_times,
+            side="right",
+        )
+        lower_indices = jnp.clip(
+            upper_indices - 1,
+            0,
+            surrogate_times.size - 2,
+        )
+        upper_indices = lower_indices + 1
+        bracket_indices = jnp.stack((lower_indices, upper_indices))
+
+        lower_times = surrogate_times[lower_indices]
+        upper_times = surrogate_times[upper_indices]
+        fractions = (safe_times - lower_times) / (upper_times - lower_times)
+        bracket_plus, bracket_cross = self.get_waveform_at_native_indices(
+            bracket_indices,
+            params,
+            theta=theta,
+            phi=phi,
+        )
+        interpolated_plus = (
+            (1.0 - fractions) * bracket_plus[0]
+            + fractions * bracket_plus[1]
+        )
+        interpolated_cross = (
+            (1.0 - fractions) * bracket_cross[0]
+            + fractions * bracket_cross[1]
+        )
+        return (
+            jnp.where(in_domain, interpolated_plus, 0.0),
+            jnp.where(in_domain, interpolated_cross, 0.0),
+        )
+
+    def get_waveform_geometric_dense(
+        self,
+        time: Float[Array, " n_sample"],
+        params: Float[Array, " n_dim"],
+        theta: Float = 0.0,
+        phi: Float = 0.0,
+    ) -> tuple[Float[Array, " n_sample"], Float[Array, " n_sample"]]:
+        """Compute the waveform by reconstructing every native-grid sample.
+
+        This is the original dense reference implementation. It remains
+        available for validation; normal calls use the mathematically
+        equivalent sparse cubic evaluator in :meth:`get_waveform_geometric`.
 
         Args:
             time (Float[Array, " n_sample"]): Time grid.
@@ -440,3 +721,76 @@ class NRHybSur3dq8Model(WaveformModel):
         hp = jnp.where(mask, waveform.real, 0.0)
         hc = jnp.where(mask, -waveform.imag, 0.0)
         return hp, hc
+
+    def get_waveform_geometric(
+        self,
+        time: Float[Array, " n_sample"],
+        params: Float[Array, " n_dim"],
+        theta: Float = 0.0,
+        phi: Float = 0.0,
+    ) -> tuple[Float[Array, " n_sample"], Float[Array, " n_sample"]]:
+        """Compute polarizations with exact sparse natural-cubic interpolation.
+
+        The natural-cubic coefficients of every fixed EIM basis are prepared at
+        model initialization. Each call therefore evaluates only the two native
+        columns bracketing each requested sample, instead of reconstructing all
+        native-grid modes and solving a spline system for every waveform.
+        """
+        if not self.sparse_cubic_enabled:
+            return self.get_waveform_geometric_dense(time, params, theta, phi)
+
+        time = jnp.asarray(time)
+        brackets = self.get_spline_brackets(time)
+        fit_params = self.get_fit_params(params)[None]
+
+        mode_22 = self.data.modes[self.mode_22_index]
+        amplitude_22 = self.get_eim_cubic_at_brackets(
+            mode_22["amp"], fit_params, brackets
+        )
+        phase_22 = -self.get_eim_cubic_at_brackets(
+            mode_22["phase"], fit_params, brackets
+        )
+
+        # T3(q, t) is eta(q)^(-3/8) times a q-independent time series,
+        # so its spline has the same separable scaling.
+        q = self.get_physical_mass_ratio(params)
+        eta = q / (1.0 + q) ** 2
+        t3_scale = (eta / 0.25) ** (-3.0 / 8.0)
+        phase_22 += t3_scale * self.evaluate_spline_from_brackets(
+            self.t3_phase_reference,
+            self.t3_phase_reference_coefficients,
+            brackets,
+        )
+        h_22 = amplitude_22 * jnp.exp(1j * phase_22)
+
+        waveform = jnp.zeros_like(time, dtype=jnp.complex64)
+        waveform += h_22 * SpinWeightedSphericalHarmonics(-2, 2, 2)(
+            theta, phi
+        )
+        waveform += jnp.conj(h_22) * SpinWeightedSphericalHarmonics(
+            -2, 2, -2
+        )(theta, phi)
+
+        for index, harmonics in enumerate(self.harmonics):
+            mode = self.mode_no22[index]
+            real = self.get_eim_cubic_at_brackets(
+                mode["real"], fit_params, brackets
+            )
+            imag = self.get_eim_cubic_at_brackets(
+                mode["imag"], fit_params, brackets
+            )
+            complex_mode = real + 1j * imag
+            waveform += complex_mode * harmonics(theta, phi)
+            waveform += (
+                self.negative_mode_prefactor[index]
+                * jnp.conj(complex_mode)
+                * self.negative_harmonics[index](theta, phi)
+            )
+
+        in_domain = (time >= self.data.sur_time[0]) & (
+            time <= self.data.sur_time[-1]
+        )
+        return (
+            jnp.where(in_domain, waveform.real, 0.0),
+            jnp.where(in_domain, -waveform.imag, 0.0),
+        )
