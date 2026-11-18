@@ -3,7 +3,12 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from jaxnrsur.NRHybSur3dq8 import NRHybSur3dq8Model
+from jaxnrsur.Harmonics import SpinWeightedSphericalHarmonics
+from jaxnrsur.NRHybSur3dq8 import (
+    NRHybSur3dq8DataLoader,
+    NRHybSur3dq8Model,
+    get_T3_phase,
+)
 
 
 @pytest.fixture(scope="module")
@@ -57,6 +62,72 @@ def test_model_initialization(model):
     assert model.n_modes > 0
     assert hasattr(model, "data")
     assert hasattr(model, "harmonics")
+
+
+def test_inertial_mode_reconstruction(monkeypatch):
+    grid = jnp.array([-1200.0, -1000.0, -800.0, -600.0])
+    constant = jnp.ones_like(grid)
+    phase_basis = 0.05 * (grid + 1000.0)
+
+    def component(basis, predictor):
+        return {"n_nodes": 1, "predictors": [predictor], "eim_basis": basis[None]}
+
+    modes = {
+        (2, 0): {
+            "real": component(constant, lambda _: 0.2),
+            "imag": component(constant, lambda _: 0.0),
+        },
+        (2, 2): {
+            "amp": component(constant, lambda fit: 1 + fit[0, 0]),
+            "phase": component(phase_basis, lambda fit: fit[0, 2]),
+        },
+        (3, 3): {
+            "real": component(constant, lambda fit: fit[0, 1]),
+            "imag": component(constant, lambda fit: 0.5 * fit[0, 1]),
+        },
+    }
+    monkeypatch.setattr(
+        "jaxnrsur.NRHybSur3dq8.load_data", lambda *_: {"domain": grid}
+    )
+    monkeypatch.setattr(
+        NRHybSur3dq8DataLoader,
+        "read_single_mode",
+        lambda self, file, mode: {"mode": mode, **modes[mode]},
+    )
+    model = NRHybSur3dq8Model(modelist=[(2, 0), (2, 2), (3, 3)])
+    params = jnp.array([3.0, 0.4, -0.2])
+    theta, phi = 1.1, 0.4
+
+    chi_a = 0.3
+    eta = 3.0 / 16.0
+    chi_hat = 0.1 + 0.5 * chi_a / (1 - 76 * eta / 113)
+    phase_22 = get_T3_phase(params[0], grid) - chi_a * phase_basis
+    h_22 = (1 + jnp.log(3.0)) * jnp.exp(1j * phase_22)
+    h_33 = chi_hat * (1 + 0.5j) * jnp.exp(1.5j * phase_22)
+    expected_modes = {
+        (2, 0): 0.2,
+        (2, 2): h_22,
+        (2, -2): jnp.conj(h_22),
+        (3, 3): h_33,
+        (3, -3): -jnp.conj(h_33),
+    }
+    expected = sum(
+        strain * SpinWeightedSphericalHarmonics(-2, ell, m)(theta, phi)
+        for (ell, m), strain in expected_modes.items()
+    )
+
+    for evaluate, times in (
+        (model.get_waveform_at_native_indices, jnp.arange(grid.size)),
+        (model.get_waveform_geometric_linear, grid),
+        (model.get_waveform_geometric_dense, grid),
+        (model.get_waveform_geometric, grid),
+    ):
+        plus, cross = evaluate(times, params, theta, phi)
+        # The sparse evaluator rescales a unit-mass-ratio T3 spline, which
+        # rounds differently from the direct T3 evaluation in float32.
+        assert jnp.allclose(plus - 1j * cross, expected, rtol=1e-4, atol=1e-6), (
+            evaluate.__name__
+        )
 
 
 def test_grad_waveform_time(model, time, params):

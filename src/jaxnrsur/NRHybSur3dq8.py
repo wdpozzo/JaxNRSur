@@ -7,7 +7,7 @@ from jaxnrsur.Spline import CubicSpline, CubicSplineFactorization
 from jaxnrsur.EIMPredictor import EIMpredictor
 from jaxnrsur.Harmonics import SpinWeightedSphericalHarmonics
 from jaxnrsur import WaveformModel
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Complex, Float, Int
 import equinox as eqx
 
 
@@ -209,32 +209,18 @@ class NRHybSur3dq8Model(WaveformModel):
                 coefficient array.
         """
         self.data = NRHybSur3dq8DataLoader(modelist=modelist)  # type: ignore
+        self.mode_22_index = modelist.index((2, 2))
+        self.mode_no22 = [mode for mode in self.data.modes if mode["mode"] != (2, 2)]
+        higher_modes = [mode["mode"] for mode in self.mode_no22]
         self.harmonics = []
         self.negative_harmonics = []
-        negative_mode_prefactor = []
-        for mode in modelist:
-            if mode != (2, 2):
-                self.harmonics.append(
-                    SpinWeightedSphericalHarmonics(-2, mode[0], mode[1])
-                )
-                self.negative_harmonics.append(
-                    SpinWeightedSphericalHarmonics(-2, mode[0], -mode[1])
-                )
-            if mode[1] > 0:
-                negative_mode_prefactor.append((-1) ** mode[0])
-            else:
-                negative_mode_prefactor.append(0)
-
-        self.mode_no22 = [
-            self.data.modes[i] for i in range(len(self.data.modes)) if i != 0
-        ]
-        self.mode_22_index = int(
-            jnp.where((jnp.array(modelist) == jnp.array([[2, 2]])).all(axis=1))[0][0]
+        for ell, m in higher_modes:
+            self.harmonics.append(SpinWeightedSphericalHarmonics(-2, ell, m))
+            self.negative_harmonics.append(SpinWeightedSphericalHarmonics(-2, ell, -m))
+        self.m_mode = jnp.array([m for _, m in higher_modes], dtype=int)
+        self.negative_mode_prefactor = jnp.array(
+            [(-1) ** ell if m > 0 else 0 for ell, m in higher_modes], dtype=int
         )
-        self.m_mode = jnp.array(
-            [modelist[i][1] for i in range(len(modelist)) if i != self.mode_22_index]
-        )
-        self.negative_mode_prefactor = jnp.array(negative_mode_prefactor)
 
         self.sparse_cubic_enabled = precompute_spline_coefficients
         if precompute_spline_coefficients:
@@ -536,11 +522,24 @@ class NRHybSur3dq8Model(WaveformModel):
             self.data.sur_time, imag
         )(time)
 
+    def _get_22_amplitude_phase(
+        self,
+        time: Float[Array, " ..."],
+        fit_params: Float[Array, "1 n_dim"],
+        q: Float[Array, ""],
+    ) -> tuple[Float[Array, " ..."], Float[Array, " ..."]]:
+        """Interpolate the amplitude and unwrapped phase of the (2,2) mode."""
+        mode_22 = self.data.modes[self.mode_22_index]
+        grid = self.data.sur_time
+        amplitude_22 = self.get_eim(mode_22["amp"], fit_params)
+        phase_22 = -self.get_eim(mode_22["phase"], fit_params) + get_T3_phase(q, grid)
+        return CubicSpline(grid, amplitude_22)(time), CubicSpline(grid, phase_22)(time)
+
     def get_22_mode(
         self,
         time: Float[Array, " n_samples"],
         params: Float[Array, " n_dim"],
-    ) -> Float[Array, " n_sample"]:
+    ) -> Complex[Array, " n_sample"]:
         """
         Compute the (2,2) mode for the waveform.
 
@@ -549,18 +548,31 @@ class NRHybSur3dq8Model(WaveformModel):
             params (Float[Array, " n_dim"]): Source parameters.
 
         Returns:
-            Float[Array, " n_sample"]: Complex (2,2) mode data.
+            Complex[Array, " n_sample"]: Complex (2,2) mode data.
         """
-        # 22 mode has weird dict that making a specical function is easier.
-        q = self.get_physical_mass_ratio(params)
-        # the EIM fits live in (log q, chi_hat, chi_a); the T3 phase wants the raw q
-        fit_params = self.get_fit_params(params)[None]
-        amp = self.get_eim(self.data.modes[self.mode_22_index]["amp"], fit_params)
-        phase = -self.get_eim(self.data.modes[self.mode_22_index]["phase"], fit_params)
-        phase = phase + get_T3_phase(q, self.data.sur_time)  # type: ignore
-        amp_interp = CubicSpline(self.data.sur_time, amp)(time)
-        phase_interp = CubicSpline(self.data.sur_time, phase)(time)
-        return amp_interp * jnp.exp(1j * phase_interp)
+        amplitude_22, phase_22 = self._get_22_amplitude_phase(
+            time,
+            self.get_fit_params(params)[None],
+            self.get_physical_mass_ratio(params),
+        )
+        return amplitude_22 * jnp.exp(1j * phase_22)
+
+    def _project_coorbital_mode(
+        self,
+        index: int,
+        coorbital_mode: Complex[Array, " ..."],
+        phase_22: Float[Array, " ..."],
+        theta: Float,
+        phi: Float,
+    ) -> Complex[Array, " ..."]:
+        # phase_22 is the continuous phase in h_22 = A_22 * exp(i * phase_22).
+        # Rotate before adding the negative-m partner from equatorial symmetry.
+        inertial_mode = coorbital_mode * jnp.exp(0.5j * self.m_mode[index] * phase_22)
+        return inertial_mode * self.harmonics[index](theta, phi) + (
+            self.negative_mode_prefactor[index]
+            * jnp.conj(inertial_mode)
+            * self.negative_harmonics[index](theta, phi)
+        )
 
     def get_waveform_at_native_indices(
         self,
@@ -595,20 +607,15 @@ class NRHybSur3dq8Model(WaveformModel):
             -2, 2, -2
         )(theta, phi)
 
-        for index, harmonics in enumerate(self.harmonics):
-            mode = self.mode_no22[index]
+        for index, mode in enumerate(self.mode_no22):
             real = self.get_eim_at_native_indices(
                 mode["real"], fit_params, native_indices
             )
             imag = self.get_eim_at_native_indices(
                 mode["imag"], fit_params, native_indices
             )
-            complex_mode = real + 1j * imag
-            waveform += complex_mode * harmonics(theta, phi)
-            waveform += (
-                self.negative_mode_prefactor[index]
-                * jnp.conj(complex_mode)
-                * self.negative_harmonics[index](theta, phi)
+            waveform += self._project_coorbital_mode(
+                index, real + 1j * imag, phase_22, theta, phi
             )
 
         return waveform.real, -waveform.imag
@@ -691,30 +698,27 @@ class NRHybSur3dq8Model(WaveformModel):
         Returns:
             tuple: Plus and cross polarizations of the waveform.
         """
-        coeff = jnp.stack(
-            jnp.array(
-                self.get_multi_real_imag(self.mode_no22, self.get_fit_params(params))
-            )
-        )
-        modes = eqx.filter_vmap(self.get_mode, in_axes=(0, 0, None))(
-            coeff[:, 0], coeff[:, 1], time
-        )
-
+        fit_params = self.get_fit_params(params)
         waveform = jnp.zeros_like(time, dtype=jnp.complex64)
 
-        h22 = self.get_22_mode(time, params)
-        waveform += h22 * SpinWeightedSphericalHarmonics(-2, 2, 2)(theta, phi)
-        waveform += jnp.conj(h22) * SpinWeightedSphericalHarmonics(-2, 2, -2)(
+        amplitude_22, phase_22 = self._get_22_amplitude_phase(
+            time, fit_params[None], self.get_physical_mass_ratio(params)
+        )
+        h_22 = amplitude_22 * jnp.exp(1j * phase_22)
+        waveform += h_22 * SpinWeightedSphericalHarmonics(-2, 2, 2)(theta, phi)
+        waveform += jnp.conj(h_22) * SpinWeightedSphericalHarmonics(-2, 2, -2)(
             theta, phi
         )
 
-        for i, harmonics in enumerate(self.harmonics):
-            waveform += modes[i] * harmonics(theta, phi)
-            waveform += (
-                self.negative_mode_prefactor[i]
-                * jnp.conj(modes[i])
-                * self.negative_harmonics[i](theta, phi)
+        if self.mode_no22:
+            coeff = jnp.array(self.get_multi_real_imag(self.mode_no22, fit_params))
+            coorbital_modes = eqx.filter_vmap(self.get_mode, in_axes=(0, 0, None))(
+                coeff[:, 0], coeff[:, 1], time
             )
+            for index, mode in enumerate(coorbital_modes):
+                waveform += self._project_coorbital_mode(
+                    index, mode, phase_22, theta, phi
+                )
 
         # Mask to ensure output is zero outside the model's time range
         mask = (time >= self.data.sur_time[0]) * (time <= self.data.sur_time[-1])
@@ -771,20 +775,15 @@ class NRHybSur3dq8Model(WaveformModel):
             -2, 2, -2
         )(theta, phi)
 
-        for index, harmonics in enumerate(self.harmonics):
-            mode = self.mode_no22[index]
+        for index, mode in enumerate(self.mode_no22):
             real = self.get_eim_cubic_at_brackets(
                 mode["real"], fit_params, brackets
             )
             imag = self.get_eim_cubic_at_brackets(
                 mode["imag"], fit_params, brackets
             )
-            complex_mode = real + 1j * imag
-            waveform += complex_mode * harmonics(theta, phi)
-            waveform += (
-                self.negative_mode_prefactor[index]
-                * jnp.conj(complex_mode)
-                * self.negative_harmonics[index](theta, phi)
+            waveform += self._project_coorbital_mode(
+                index, real + 1j * imag, phase_22, theta, phi
             )
 
         in_domain = (time >= self.data.sur_time[0]) & (
